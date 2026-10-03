@@ -2851,9 +2851,14 @@ impl<'a> Socket<'a> {
         // We've sent a packet successfully, so we can update the internal state now.
         // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.remote_last_seq = self
-            .remote_last_seq
-            .max(repr.seq_number + repr.segment_len());
+        // Empty segments carry the highest sequence number sent rather than their position
+        // in the send queue (see `empty_segment_seq`); they must not undo a rewind for
+        // retransmission.
+        if repr.segment_len() > 0 {
+            self.remote_last_seq = self
+                .remote_last_seq
+                .max(repr.seq_number + repr.segment_len());
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -7363,6 +7368,71 @@ mod test {
         recv!(s, time 1010, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 2048,
             ack_number: Some(REMOTE_SEQ + 1 + 3),
+            window_len: 61,
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_ack_after_rto_keeps_the_retransmission_point() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+
+        let data = [b'x'; 4096];
+        s.send_slice(&data[..]).unwrap();
+
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // Both segments were lost; the RTO resends the first one.
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1000);
+
+        // The remote sends data; our ACK carries the highest sequence number sent.
+        send!(s, time 1010, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            window_len: 61,
+            ..RECV_TEMPL
+        }));
+
+        // That ACK must not move the retransmission point: once the resent segment is
+        // acknowledged, the second lost segment is resent next (as much as the remote's
+        // 256-byte window allows), not new data after it.
+        send!(s, time 1020, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 3,
+            ack_number: Some(LOCAL_SEQ + 1 + 1024),
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1020, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            payload:    &data[..256],
             window_len: 61,
             ..RECV_TEMPL
         }));
