@@ -2202,8 +2202,11 @@ impl<'a> Socket<'a> {
         }
 
         // start/stop the Zero Window Probe timer.
+        // Data in flight stays under the retransmission timer: probing past it would never
+        // resend the data if it was lost.
         if self.remote_win_len == 0
             && !self.tx_buffer.is_empty()
+            && !self.timer.is_retransmit()
             && (self.timer.is_idle() || ack_len > 0)
         {
             let delay = self.rtte.retransmission_timeout();
@@ -2484,7 +2487,8 @@ impl<'a> Socket<'a> {
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
-            if let Timer::Retransmit { .. } = self.timer {
+            let is_rto = matches!(self.timer, Timer::Retransmit { .. });
+            if is_rto {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting after rto");
 
@@ -2519,6 +2523,16 @@ impl<'a> Socket<'a> {
             // infinite polling loop where `poll_at` returns `Now` but `dispatch`
             // can't actually do anything.
             self.timer.set_for_idle(cx.now(), self.keep_alive);
+
+            // A zero window blocks the retransmission, and nothing else would restart a
+            // timer. Probe at once instead: the probe carries the first byte from SND.UNA,
+            // and further probes back off from the current RTO.
+            if is_rto && self.remote_win_len == 0 && !self.tx_buffer.is_empty() {
+                self.timer = Timer::ZeroWindowProbe {
+                    expires_at: cx.now(),
+                    delay: self.rtte.retransmission_timeout(),
+                };
+            }
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
@@ -8625,6 +8639,54 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn test_zero_window_probe_keeps_retransmit_timer() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+
+        // The remote acknowledges "ab" and closes its window; "cdef" was lost.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 2),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+
+        // The lost data must stay covered by the retransmission timer.
+        assert!(s.timer.is_retransmit());
+
+        // When it expires, the zero window turns the retransmission into a probe
+        // at SND.UNA instead of leaving the socket without any timer.
+        recv_nothing!(s, time 1009);
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"c"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1010);
+
+        // Once the window reopens, everything from SND.UNA is resent.
+        send!(s, time 1100, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 2),
+            window_len: 6,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"cdef"[..],
+            ..RECV_TEMPL
+        }));
     }
 
     // =========================================================================================//
