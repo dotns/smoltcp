@@ -765,6 +765,18 @@ impl<'a> Socket<'a> {
         u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
+    /// Return the sequence number of segments that occupy no sequence space.
+    ///
+    /// A retransmission timeout rewinds `remote_last_seq` to SND.UNA, but the remote may
+    /// already have received data past it, and a SEQ below its RCV.NXT makes the segment
+    /// unacceptable (RFC 9293 3.10.7.4). Use the highest sequence number sent instead.
+    fn empty_segment_seq(&self) -> TcpSeqNumber {
+        match self.rtte.max_seq_sent {
+            Some(max_seq_sent) if max_seq_sent > self.remote_last_seq => max_seq_sent,
+            _ => self.remote_last_seq,
+        }
+    }
+
     /// Return the last window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
@@ -1482,7 +1494,7 @@ impl<'a> Socket<'a> {
         // [...] an empty acknowledgment segment containing the current send-sequence number
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
-        reply_repr.seq_number = self.remote_last_seq;
+        reply_repr.seq_number = self.empty_segment_seq();
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
         self.remote_last_ack = reply_repr.ack_number;
 
@@ -2736,6 +2748,10 @@ impl<'a> Socket<'a> {
 
             // In FIN-WAIT-2 and TIME-WAIT states we may only transmit ACKs for incoming data or FIN
             State::FinWait2 | State::TimeWait => {}
+        }
+
+        if repr.segment_len() == 0 {
+            repr.seq_number = self.empty_segment_seq();
         }
 
         // There might be more than one reason to send a packet. E.g. the keep-alive timer
@@ -7283,6 +7299,59 @@ mod test {
             u8::MAX,
             "duplicate ACK count should not overflow but saturate"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-reno")]
+    fn test_ack_after_rto_carries_highest_seq_sent() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_win_len = 65535;
+        s.remote_mss = 1024;
+
+        let data = [b'x'; 4096];
+        s.send_slice(&data[..]).unwrap();
+
+        // Reno's initial cwnd is 2048: two segments go out.
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // The RTO collapses cwnd to one segment, so only the first one is resent.
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..1024],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1000);
+
+        // The remote received both segments but its ACK was lost. Our ACK of its
+        // data must carry SND.NXT, not the rewound retransmission point: the remote
+        // finds a SEQ below its RCV.NXT unacceptable and drops the whole segment
+        // (RFC 9293 3.10.7.4), ACK field included.
+        send!(s, time 1010, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"abc"[..],
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1 + 3),
+            window_len: 61,
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]
