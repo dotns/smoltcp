@@ -2662,8 +2662,6 @@ impl<'a> Socket<'a> {
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
-                    self.pending_fast_retransmit = false;
-
                     0
                 } else {
                     // Right edge of window, ie the max sequence number we're allowed to send.
@@ -2819,6 +2817,11 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
+
+        // A pending fast retransmission is done only once its segment was emitted. The
+        // timer that triggered it is already reset, so if emitting failed, nothing but this
+        // flag would resend the segment.
+        self.pending_fast_retransmit = false;
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -7056,6 +7059,66 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + (3 * 5)),
             ..SEND_TEMPL
         });
+    }
+
+    #[test]
+    fn test_fast_retransmit_survives_a_failed_emit() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDDeeeFFF").unwrap();
+
+        // The first segment is lost, the next three arrive.
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1005, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"BBB"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + (3 * 2),
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1015, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + (3 * 3),
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"DDD"[..],
+            ..RECV_TEMPL
+        }));
+
+        for time in [1050, 1055, 1060] {
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+
+        // The device cannot take the fast retransmission (e.g. its queue is full).
+        s.cx.set_now(Instant::from_millis(1100));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err(())), Err(()));
+
+        // The next dispatch still resends the lost segment: the triple duplicate ACK is
+        // not repeated, and nothing else would resend it.
+        recv!(s, time 1105, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
     }
 
     #[test]
