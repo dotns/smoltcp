@@ -2128,7 +2128,10 @@ impl<'a> Socket<'a> {
                         }
                     );
 
-                    if self.local_rx_dup_acks == 3 {
+                    // Fast retransmit resends data from the transmit buffer. When only a FIN
+                    // (or SYN) is outstanding there is none: replacing the retransmission
+                    // timer would then leave the FIN without any timer at all.
+                    if self.local_rx_dup_acks == 3 && !self.tx_buffer.is_empty() {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -7117,6 +7120,36 @@ mod test {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_duplicate_acks_keep_the_fin_under_the_retransmission_timer() {
+        let mut s = socket_established();
+        s.close();
+        recv!(s, time 0, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+
+        // The FIN is lost; the remote keeps acknowledging the byte before it.
+        for time in [10, 20, 30, 40] {
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        recv_nothing!(s, time 50);
+
+        // The retransmission timer still runs and resends the FIN.
+        recv!(s, time 2000, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
     }
