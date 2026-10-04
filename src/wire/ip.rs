@@ -769,38 +769,58 @@ pub mod checksum {
         ((sum >> 16) as u16) + (sum as u16)
     }
 
+    /// Fold a sum of 16-bit words to 16 bits with end-around carry.
+    ///
+    /// Every 16-bit lane of the sum carries the same weight in one's complement arithmetic
+    /// (2^16, 2^32 and 2^64 are all 1 modulo 2^16 - 1), so a sum of wider words folds to the
+    /// same checksum as the sum of the 16-bit words they consist of.
+    const fn fold(sum: u128) -> u16 {
+        let sum = (sum >> 64) + (sum & u64::MAX as u128);
+        let sum = ((sum >> 64) + (sum & u64::MAX as u128)) as u64;
+        let sum = (sum >> 32) + (sum & 0xffff_ffff);
+        let sum = (sum >> 32) + (sum & 0xffff_ffff);
+        propagate_carries(sum as u32)
+    }
+
     /// Compute an RFC 1071 compliant checksum (without the final complement).
     pub fn data(data: &[u8]) -> u16 {
         // We calculate the sum in native-endian before converting to big-endian at the end
         // see RFC 1071 section 2.(B) for details
-        let mut accum: u32 = 0;
-
-        // We manually unroll this hot loop.
-        // When optimizing for size (as is common for microcontrollers) the compiler will not unroll
-        // this. Manually unrolling allows us to do more work per loop tax (compare and branch).
-        // It does not seem to affect the auto-vectorization on bigger machines.
-        let (chunks, mut rem) = data.as_chunks::<4>();
-        for chunk in chunks {
-            let val_0 = u16::from_ne_bytes(chunk[..2].try_into().unwrap());
-            let val_1 = u16::from_ne_bytes(chunk[2..4].try_into().unwrap());
-            accum += val_0 as u32;
-            accum += val_1 as u32;
+        //
+        // The sum runs over 64-bit words into 128-bit accumulators, which cannot overflow
+        // and compile to an add-with-carry per word. Two accumulators keep two independent
+        // carry chains in flight.
+        let mut accum: [u128; 2] = [0; 2];
+        let (blocks, rem) = data.as_chunks::<16>();
+        for block in blocks {
+            let (words, _) = block.as_chunks::<8>();
+            accum[0] += u64::from_ne_bytes(words[0]) as u128;
+            accum[1] += u64::from_ne_bytes(words[1]) as u128;
         }
+        let mut accum = accum[0] + accum[1];
 
-        // Handle 2 bytes of tail, if present.
-        if rem.len() >= 2 {
-            let val = u16::from_ne_bytes(rem[..2].try_into().unwrap());
-            accum += val as u32;
-            rem = &rem[2..];
+        // Handle up to 15 bytes of tail. Each piece starts at an even offset, so its 16-bit
+        // lanes line up with the words of the data.
+        let mut rem = rem;
+        if let Some((word, rest)) = rem.split_first_chunk::<8>() {
+            accum += u64::from_ne_bytes(*word) as u128;
+            rem = rest;
+        }
+        if let Some((word, rest)) = rem.split_first_chunk::<4>() {
+            accum += u32::from_ne_bytes(*word) as u128;
+            rem = rest;
+        }
+        if let Some((word, rest)) = rem.split_first_chunk::<2>() {
+            accum += u16::from_ne_bytes(*word) as u128;
+            rem = rest;
         }
 
         // Add the last remaining odd byte, if any.
         if let Some(&value) = rem.first() {
-            accum += u16::from_ne_bytes([value, 0]) as u32;
+            accum += u16::from_ne_bytes([value, 0]) as u128;
         }
 
-        let collapsed = propagate_carries(accum);
-        u16::to_be(collapsed)
+        u16::to_be(fold(accum))
     }
 
     /// Combine several RFC 1071 compliant checksums.
@@ -974,9 +994,87 @@ pub(crate) mod test {
     #![allow(unused)]
 
     use super::*;
+
     use crate::wire::{IpAddress, IpCidr, IpProtocol, IpRepr};
     #[cfg(feature = "proto-ipv4")]
     use crate::wire::{Ipv4Address, Ipv4Repr};
+
+    /// The 16-bit word sum of RFC 1071, one word at a time.
+    fn reference_checksum(data: &[u8]) -> u16 {
+        let mut sum: u64 = 0;
+        for pair in data.chunks(2) {
+            sum += u64::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+        }
+        while sum > 0xffff {
+            sum = (sum >> 16) + (sum & 0xffff);
+        }
+        sum as u16
+    }
+
+    /// `checksum::data` as of smoltcp 0.14.0 (16-bit words into a 32-bit sum).
+    fn checksum_v0_14(data: &[u8]) -> u16 {
+        let mut accum: u32 = 0;
+        let (chunks, mut rem) = data.as_chunks::<2>();
+        for chunk in chunks {
+            accum += u16::from_ne_bytes(*chunk) as u32;
+        }
+        if let Some(&value) = rem.first() {
+            accum += u16::from_ne_bytes([value, 0]) as u32;
+            rem = &rem[1..];
+        }
+        debug_assert!(rem.is_empty());
+        let sum = (accum >> 16) + (accum & 0xffff);
+        u16::to_be(((sum >> 16) as u16) + (sum as u16))
+    }
+
+    #[test]
+    fn checksum_data_matches_reference() {
+        // Deterministic pseudo-random contents (a 64-bit LCG).
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut buf = [0u8; 2016];
+        for byte in buf.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 56) as u8;
+        }
+        for len in 0..=2000 {
+            // Every alignment of the start relative to the 16-byte blocks and 8-byte words.
+            for offset in 0..16 {
+                let data = &buf[offset..offset + len];
+                assert_eq!(
+                    checksum::data(data),
+                    reference_checksum(data),
+                    "len {len} offset {offset}"
+                );
+                assert_eq!(
+                    checksum::data(data),
+                    checksum_v0_14(data),
+                    "len {len} offset {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_data_extremes() {
+        let ones = [0xffu8; 4099];
+        let zeros = [0u8; 4099];
+        for len in 0..=ones.len() {
+            assert_eq!(
+                checksum::data(&ones[..len]),
+                reference_checksum(&ones[..len])
+            );
+            assert_eq!(checksum::data(&zeros[..len]), 0);
+        }
+        // Long enough to overflow a 32-bit sum of 0xffff words.
+        let long = [0xffu8; 300_000];
+        assert_eq!(checksum::data(&long), 0xffff);
+        assert_eq!(
+            checksum::data(&long[..299_999]),
+            reference_checksum(&long[..299_999])
+        );
+    }
 
     #[test]
     #[cfg(feature = "proto-ipv4")]
