@@ -760,9 +760,25 @@ impl<'a> Socket<'a> {
     /// Return the current window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
+    ///
+    /// The right edge of the window (ACK + window) never moves left of the last advertised one
+    /// (RFC 9293 3.8.6, RFC 7323 2.4). Rounding the free buffer space down to the window scale
+    /// does that whenever the ACK moved by other than a multiple of the scale unit, down to a
+    /// zero window while the remote still has data in flight towards the edge. In that case the
+    /// free space is rounded up instead. The window then reaches less than one scale unit past
+    /// the buffer, and `process` only accepts what fits.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let window = self.rx_buffer.window();
+        let mut scaled = window >> self.remote_win_shift;
+        if let Some(last_ack) = self.remote_last_ack {
+            let last_edge = last_ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+            let next_ack = self.remote_seq_no + self.rx_buffer.len();
+            if next_ack + (scaled << self.remote_win_shift) < last_edge {
+                scaled = window.div_ceil(1 << self.remote_win_shift);
+            }
+        }
+        u16::try_from(scaled).unwrap_or(u16::MAX)
     }
 
     /// Return the sequence number of segments that occupy no sequence space.
@@ -1496,12 +1512,13 @@ impl<'a> Socket<'a> {
         // to be received.
         reply_repr.seq_number = self.empty_segment_seq();
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
+        // (computed before `remote_last_ack` moves: it compares with the last right edge)
         reply_repr.window_len = self.scaled_window();
+        self.remote_last_ack = reply_repr.ack_number;
         self.remote_last_win = reply_repr.window_len;
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
@@ -1717,7 +1734,10 @@ impl<'a> Socket<'a> {
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+            // A window rounded up to the scale (see `scaled_window`) may reach past the free
+            // buffer space; take only what fits.
+            (last_ack + ((self.remote_last_win as usize) << self.remote_win_shift))
+                .min(window_start + self.rx_buffer.window())
         } else {
             window_start
         };
@@ -4789,6 +4809,172 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 1400),
                 window_len: 65185,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// An established socket with a 100-byte receive buffer and a window scale of 4
+    /// (16-byte units), which last advertised 6 units (96 bytes) at `REMOTE_SEQ + 1`.
+    fn socket_established_scaled_small_rx() -> TestSocket {
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 100]);
+        s.assembler = Assembler::new();
+        s.remote_win_scale = Some(0);
+        s.remote_win_shift = 4;
+        s.remote_last_win = 6;
+        assert_eq!(s.scaled_window(), 6);
+        s
+    }
+
+    #[test]
+    fn test_scaled_window_does_not_shrink_right_edge() {
+        let mut s = socket_established_scaled_small_rx();
+        // 10 bytes leave 90 free: rounded down that is 5 units, a right edge at
+        // REMOTE_SEQ + 1 + 10 + 80, left of the advertised REMOTE_SEQ + 1 + 96.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 10],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 10),
+                window_len: 6,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_scaled_window_does_not_round_to_zero_below_advertised_edge() {
+        let mut s = socket_established_scaled_small_rx();
+        // 86 bytes leave 14 free, which rounds down to a zero window although the
+        // advertised right edge is 10 bytes further.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 86],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 86),
+                window_len: 1,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_scaled_window_rounded_up_accepts_only_buffer_space() {
+        let mut s = socket_established_scaled_small_rx();
+        let data: Vec<u8> = (0..102).collect();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &data[..86],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 86),
+                window_len: 1,
+                ..RECV_TEMPL
+            }]
+        );
+        // The rounded-up unit reaches 2 bytes past the buffer: the remote may send them,
+        // and only the 14 bytes that fit are taken.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 86,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &data[86..102],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 100),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut buf = [0; 128];
+        assert_eq!(s.recv_slice(&mut buf), Ok(100));
+        assert_eq!(&buf[..100], &data[..100]);
+    }
+
+    #[test]
+    fn test_scaled_window_ack_reply_uses_last_right_edge() {
+        let mut s = socket_established_scaled_small_rx();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 16],
+                ..SEND_TEMPL
+            }
+        );
+        // A segment past the window is answered right away. 16 bytes moved the ACK by one
+        // unit, so the window is 5 units, neither shrunk nor rounded up past the buffer.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 200,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 10],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 16),
+                window_len: 5,
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    #[test]
+    fn test_scaled_window_aligned_edge_stays_rounded_down() {
+        let mut s = socket_established_scaled_small_rx();
+        // 16 bytes move the ACK by one unit: 84 free bytes round down to 5 units, the
+        // same right edge as before, so nothing is rounded up.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 16],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 16),
+                window_len: 5,
                 ..RECV_TEMPL
             }]
         );
