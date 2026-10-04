@@ -173,6 +173,18 @@ impl Controller for Cubic {
         self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.mss);
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize) {
+        // RFC 6582 3.2 (5): deflate `cwnd` by the amount of new data acknowledged, and add
+        // back one MSS if that is at least one MSS.
+        if self.in_fast_recovery {
+            let mut cwnd = self.cwnd.saturating_sub(len);
+            if len >= self.mss {
+                cwnd = cwnd.saturating_add(self.mss);
+            }
+            self.cwnd = cwnd.min(self.rwnd).max(self.mss);
+        }
+    }
+
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
@@ -434,6 +446,37 @@ mod test {
         ack(&mut cubic, MSS, Instant::from_millis(2));
         assert!(!cubic.in_fast_recovery);
         assert_eq!(cubic.window(), ssthresh);
+    }
+
+    #[test]
+    fn partial_ack_deflates_and_stays_in_fast_recovery() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = MSS * 32;
+
+        cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
+        let ssthresh = cubic.ssthresh;
+        let cwnd = cubic.window();
+
+        // RFC 6582: deflate by the amount acknowledged, add back one MSS if at least one
+        // MSS was acknowledged, and stay in fast recovery.
+        cubic.on_partial_ack(Instant::from_millis(1), 3 * MSS);
+        assert!(cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), cwnd - 2 * MSS);
+        cubic.on_partial_ack(Instant::from_millis(2), MSS / 2);
+        assert!(cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), cwnd - 2 * MSS - MSS / 2);
+        assert_eq!(cubic.ssthresh, ssthresh);
+
+        // The full ACK exits and deflates to ssthresh.
+        ack(&mut cubic, MSS, Instant::from_millis(3));
+        assert!(!cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), ssthresh);
+
+        // Outside fast recovery a partial ACK changes nothing.
+        let cwnd = cubic.window();
+        cubic.on_partial_ack(Instant::from_millis(4), 2 * MSS);
+        assert_eq!(cubic.window(), cwnd);
     }
 
     #[test]

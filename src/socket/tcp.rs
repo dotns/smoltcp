@@ -523,6 +523,12 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// The highest sequence number sent when fast recovery started or a retransmission
+    /// timeout expired last (`recover` of RFC 6582), until an ACK reaches it.
+    recover: Option<TcpSeqNumber>,
+    /// Whether fast recovery is in progress: an ACK of new data below `recover` (a partial
+    /// ACK) resends the next unacknowledged segment at once (RFC 6582 NewReno).
+    in_fast_recovery: bool,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -614,6 +620,8 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            recover: None,
+            in_fast_recovery: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -952,6 +960,8 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.recover = None;
+        self.in_fast_recovery = false;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1869,6 +1879,7 @@ impl<'a> Socket<'a> {
         let mut ack_len = 0;
         let mut ack_of_fin = false;
         let mut ack_all = false;
+        let mut partial_ack = false;
         if repr.control != TcpControl::Rst
             && let Some(ack_number) = repr.ack_number
         {
@@ -2151,7 +2162,17 @@ impl<'a> Socket<'a> {
                     // Fast retransmit resends data from the transmit buffer. When only a FIN
                     // (or SYN) is outstanding there is none: replacing the retransmission
                     // timer would then leave the FIN without any timer at all.
-                    if self.local_rx_dup_acks == 3 && !self.tx_buffer.is_empty() {
+                    //
+                    // RFC 6582 3.2 (1), the careful variant: while `recover` is set, the ACK
+                    // is below it (it is cleared once an ACK reaches it), so these duplicates
+                    // belong to a loss already being recovered (or to data resent after a
+                    // timeout) and start no further fast retransmit.
+                    if self.local_rx_dup_acks == 3
+                        && !self.tx_buffer.is_empty()
+                        && self.recover.is_none()
+                    {
+                        self.recover = Some(self.empty_segment_seq());
+                        self.in_fast_recovery = true;
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2176,13 +2197,35 @@ impl<'a> Socket<'a> {
 
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
-                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.inner_mut().on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    match self.recover {
+                        // RFC 6582 3.2 (5): a partial ACK keeps fast recovery going and
+                        // retransmits the first unacknowledged segment (below, once the
+                        // timers are updated).
+                        Some(recover)
+                            if self.in_fast_recovery && ack_len > 0 && ack_number < recover =>
+                        {
+                            net_debug!("partial ACK {} in fast recovery", ack_number);
+                            partial_ack = true;
+                            self.congestion_controller
+                                .inner_mut()
+                                .on_partial_ack(cx.now(), ack_len);
+                        }
+                        _ => {
+                            // RFC 6582 3.2 (4): an ACK that reaches `recover` ends fast
+                            // recovery.
+                            if self.recover.is_some_and(|recover| ack_number >= recover) {
+                                self.recover = None;
+                                self.in_fast_recovery = false;
+                            }
+                            let new_flight_size = self.flight_size().saturating_sub(ack_len);
+                            self.congestion_controller.inner_mut().on_ack(
+                                cx.now(),
+                                ack_len,
+                                new_flight_size,
+                                &self.rtte,
+                            );
+                        }
+                    }
                 }
             };
 
@@ -2222,6 +2265,13 @@ impl<'a> Socket<'a> {
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
             _ => {}
+        }
+
+        // Resend the segment at the partial ACK now rather than after three more duplicate
+        // ACKs or a timeout. As for the third duplicate ACK, a FIN alone outstanding stays
+        // under the retransmission timer.
+        if partial_ack && !self.tx_buffer.is_empty() {
+            self.timer.set_for_fast_retransmit();
         }
 
         // start/stop the Zero Window Probe timer.
@@ -2520,6 +2570,11 @@ impl<'a> Socket<'a> {
                 self.congestion_controller
                     .inner_mut()
                     .on_rto(cx.now(), in_flight);
+
+                // RFC 6582 3.2 (6): a timeout ends fast recovery, and duplicate ACKs of
+                // the data sent so far start no fast retransmit.
+                self.recover = Some(self.empty_segment_seq());
+                self.in_fast_recovery = false;
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -7338,6 +7393,280 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
+    }
+
+    /// An established socket with an MSS of 3 that sent `aaaBBBcccDDDeeeFFF` as six
+    /// segments at time 1000, from `LOCAL_SEQ + 1` to `LOCAL_SEQ + 19`.
+    fn socket_sent_six_segments() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDDeeeFFF").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD", b"eee", b"FFF"]
+            .into_iter()
+            .enumerate()
+        {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+        s
+    }
+
+    /// The remote acknowledges `LOCAL_SEQ + ack` at `time`.
+    #[track_caller]
+    fn ack_at(s: &mut TestSocket, time: i64, ack: usize) {
+        assert_eq!(
+            send(
+                s,
+                Instant::from_millis(time),
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + ack),
+                    ..SEND_TEMPL
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_new_reno_partial_acks_recover_every_loss_of_a_window() {
+        let mut s = socket_sent_six_segments();
+
+        // aaa, ccc and eee are lost; BBB, DDD and FFF each elicit a duplicate ACK.
+        for time in [1050, 1055, 1060] {
+            ack_at(&mut s, time, 1);
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1101);
+        assert!(s.in_fast_recovery);
+        assert_eq!(s.recover, Some(LOCAL_SEQ + 19));
+
+        // Each partial ACK resends exactly the segment at the new SND.UNA, at once.
+        ack_at(&mut s, 1150, 7);
+        recv!(s, time 1150, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1151);
+        assert!(s.in_fast_recovery);
+
+        ack_at(&mut s, 1200, 13);
+        recv!(s, time 1200, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 13,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"eee"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1201);
+        assert!(s.in_fast_recovery);
+
+        // Everything is recovered long before the first retransmission timeout could
+        // expire (1 s after the segments were sent), and no timer runs any more.
+        ack_at(&mut s, 1250, 19);
+        assert!(!s.in_fast_recovery);
+        assert_eq!(s.recover, None);
+        assert!(s.timer.is_idle());
+        assert!(s.tx_buffer.is_empty());
+        recv_nothing!(s, time 5000);
+    }
+
+    #[test]
+    fn test_new_reno_full_ack_exits_recovery() {
+        let mut s = socket_sent_six_segments();
+
+        // Only aaa is lost.
+        for time in [1050, 1055, 1060] {
+            ack_at(&mut s, time, 1);
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        ack_at(&mut s, 1150, 19);
+        assert!(!s.in_fast_recovery);
+        assert_eq!(s.recover, None);
+        recv_nothing!(s, time 1151);
+
+        // A loss in the next window starts fast retransmit again.
+        s.send_slice(b"gggHHHiiiJJJ").unwrap();
+        for (i, payload) in [b"ggg", b"HHH", b"iii", b"JJJ"].into_iter().enumerate() {
+            recv!(s, time 1200, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 19 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+        for time in [1250, 1255, 1260] {
+            ack_at(&mut s, time, 19);
+        }
+        assert!(s.in_fast_recovery);
+        assert_eq!(s.recover, Some(LOCAL_SEQ + 31));
+        recv!(s, time 1300, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 19,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ggg"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_new_reno_duplicate_acks_below_recover_do_not_retrigger() {
+        let mut s = socket_sent_six_segments();
+
+        // aaa and ccc are lost.
+        for time in [1050, 1055, 1060] {
+            ack_at(&mut s, time, 1);
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        ack_at(&mut s, 1150, 7);
+        recv!(s, time 1150, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+
+        // Three more duplicates of the partial ACK (e.g. duplicated segments) are below
+        // `recover`: no further fast retransmit, and the window is not cut again.
+        for time in [1160, 1165, 1170] {
+            ack_at(&mut s, time, 7);
+        }
+        assert_eq!(s.local_rx_dup_acks, 3);
+        assert!(!matches!(s.timer, Timer::FastRetransmit));
+        recv_nothing!(s, time 1200);
+        assert!(s.in_fast_recovery);
+
+        ack_at(&mut s, 1250, 19);
+        assert!(!s.in_fast_recovery);
+        recv_nothing!(s, time 1251);
+    }
+
+    #[test]
+    fn test_new_reno_partial_ack_leaves_a_lone_fin_to_the_retransmission_timer() {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaBBBcccDDD").unwrap();
+        for (i, payload) in [b"aaa", b"BBB", b"ccc", b"DDD"].into_iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+        s.close();
+        recv!(s, time 1010, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 13,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+
+        // aaa and the FIN are lost.
+        for time in [1050, 1055, 1060] {
+            ack_at(&mut s, time, 1);
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.recover, Some(LOCAL_SEQ + 14));
+
+        // The partial ACK leaves only the FIN outstanding: no fast retransmission (it
+        // would find no data), the retransmission timer keeps running and resends it.
+        ack_at(&mut s, 1150, 13);
+        assert!(s.timer.is_retransmit());
+        recv_nothing!(s, time 1151);
+        recv!(s, time 5000, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 13,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        assert!(!s.in_fast_recovery);
+    }
+
+    #[test]
+    fn test_new_reno_retransmission_timeout_exits_recovery() {
+        let mut s = socket_sent_six_segments();
+
+        // aaa and ccc are lost, and so is the fast retransmission of aaa.
+        for time in [1050, 1055, 1060] {
+            ack_at(&mut s, time, 1);
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.in_fast_recovery);
+        recv_nothing!(s, time 1200);
+
+        // The retransmission timeout resends from SND.UNA and ends fast recovery; `recover`
+        // moves to the highest sequence number sent.
+        recv!(s, time 3000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(!s.in_fast_recovery);
+        assert_eq!(s.recover, Some(LOCAL_SEQ + 19));
+
+        // The resent aaa fills the first hole; resending continues at ccc.
+        ack_at(&mut s, 3010, 7);
+        recv!(s, time 3010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"ccc"[..],
+            ..RECV_TEMPL
+        }));
+
+        // Duplicate ACKs below `recover`, as the remote's replies to data it already had
+        // and that is resent after the timeout, start no fast retransmit.
+        for time in [3020, 3025, 3030] {
+            ack_at(&mut s, time, 7);
+        }
+        assert_eq!(s.local_rx_dup_acks, 3);
+        assert!(!matches!(s.timer, Timer::FastRetransmit));
+        assert!(!s.pending_fast_retransmit);
+        assert!(!s.in_fast_recovery);
+
+        // An ACK reaching `recover` clears it.
+        ack_at(&mut s, 3050, 19);
+        assert_eq!(s.recover, None);
     }
 
     #[test]

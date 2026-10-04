@@ -67,6 +67,18 @@ impl Controller for Reno {
         self.cwnd = self.cwnd.saturating_add(inc).min(self.rwnd).max(self.mss);
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize) {
+        // RFC 6582 3.2 (5): deflate `cwnd` by the amount of new data acknowledged, and add
+        // back one MSS if that is at least one MSS.
+        if self.in_fast_recovery {
+            let mut cwnd = self.cwnd.saturating_sub(len);
+            if len >= self.mss {
+                cwnd = cwnd.saturating_add(self.mss);
+            }
+            self.cwnd = cwnd.min(self.rwnd).max(self.mss);
+        }
+    }
+
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);
@@ -355,6 +367,37 @@ mod test {
         ack(&mut reno, MSS, Instant::from_millis(2));
         assert!(!reno.in_fast_recovery);
         assert_eq!(reno.window(), ssthresh);
+    }
+
+    #[test]
+    fn partial_ack_deflates_and_stays_in_fast_recovery() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+        reno.cwnd = MSS * 32;
+
+        reno.on_loss(Instant::from_millis(0), reno.cwnd);
+        let ssthresh = reno.ssthresh;
+        let cwnd = reno.window();
+
+        // RFC 6582: deflate by the amount acknowledged, add back one MSS if at least one
+        // MSS was acknowledged, and stay in fast recovery.
+        reno.on_partial_ack(Instant::from_millis(1), 3 * MSS);
+        assert!(reno.in_fast_recovery);
+        assert_eq!(reno.window(), cwnd - 2 * MSS);
+        reno.on_partial_ack(Instant::from_millis(2), MSS / 2);
+        assert!(reno.in_fast_recovery);
+        assert_eq!(reno.window(), cwnd - 2 * MSS - MSS / 2);
+        assert_eq!(reno.ssthresh, ssthresh);
+
+        // The full ACK exits and deflates to ssthresh.
+        ack(&mut reno, MSS, Instant::from_millis(3));
+        assert!(!reno.in_fast_recovery);
+        assert_eq!(reno.window(), ssthresh);
+
+        // Outside fast recovery a partial ACK changes nothing.
+        let cwnd = reno.window();
+        reno.on_partial_ack(Instant::from_millis(4), 2 * MSS);
+        assert_eq!(reno.window(), cwnd);
     }
 
     #[test]
