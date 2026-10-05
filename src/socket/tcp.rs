@@ -529,6 +529,9 @@ pub struct Socket<'a> {
     /// Whether fast recovery is in progress: an ACK of new data below `recover` (a partial
     /// ACK) resends the next unacknowledged segment at once (RFC 6582 NewReno).
     in_fast_recovery: bool,
+    /// The end of the last data segment sent below the MSS, for sender-side silly window
+    /// syndrome avoidance: another one cut short by a window waits until this is acked.
+    small_segment_end: Option<TcpSeqNumber>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -622,6 +625,7 @@ impl<'a> Socket<'a> {
             pending_fast_retransmit: false,
             recover: None,
             in_fast_recovery: false,
+            small_segment_end: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -962,6 +966,7 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = None;
         self.recover = None;
         self.in_fast_recovery = false;
+        self.small_segment_end = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1434,6 +1439,27 @@ impl<'a> Socket<'a> {
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
+    }
+
+    /// Sender-side silly window syndrome avoidance (RFC 9293 3.8.6.2.1) with Minshall's
+    /// variant of the Nagle algorithm: whether a new segment of `size` octets, cut below
+    /// the MSS by the remote or congestion window while more data waits behind it, is
+    /// held back because an earlier sub-MSS segment is still unacknowledged.
+    ///
+    /// The congestion window counts octets and need not be a multiple of the MSS, and
+    /// each ACK frees the octets of the segment it acknowledges. Without this, every
+    /// remainder goes out as a small segment, and after losses the segments shrink for
+    /// good. One small segment per round trip still goes out, so a window that is not a
+    /// multiple of the MSS keeps its extra segment (and its duplicate ACK after a loss),
+    /// and data in flight guarantees an ACK that releases the held octets.
+    fn sws_holds(&self, size: usize, effective_mss: usize) -> bool {
+        let unsent = self.tx_buffer.len().saturating_sub(self.flight_size());
+        size < effective_mss
+            && size < unsent
+            && self.remote_last_seq != self.local_seq_no
+            && self
+                .small_segment_end
+                .is_some_and(|end| end > self.local_seq_no)
     }
 
     fn cwnd_remaining(&self) -> usize {
@@ -2451,6 +2477,10 @@ impl<'a> Socket<'a> {
             can_send = false;
         }
 
+        if self.sws_holds(max_send.min(effective_mss), effective_mss) {
+            can_send = false;
+        }
+
         // Can we actually send the FIN? We can send it if:
         // 1. We have unsent data that fits in the remote window.
         // 2. We have no unsent data.
@@ -2679,6 +2709,8 @@ impl<'a> Socket<'a> {
         };
 
         let mut is_zero_window_probe = false;
+        // The MSS of a data segment; a shorter one is a small segment for SWS avoidance.
+        let mut data_mss = 0;
 
         #[cfg_attr(
             not(feature = "segmentation-offload"),
@@ -2734,6 +2766,7 @@ impl<'a> Socket<'a> {
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                data_mss = effective_mss;
 
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
@@ -2804,7 +2837,12 @@ impl<'a> Socket<'a> {
                         // the remote got lost.
                         win_limit.min(device_limit)
                     } else {
-                        win_limit.min(device_limit).min(self.cwnd_remaining())
+                        let size = win_limit.min(device_limit).min(self.cwnd_remaining());
+                        if self.sws_holds(size, effective_mss) {
+                            0
+                        } else {
+                            size
+                        }
                     };
 
                     let offset = self.flight_size();
@@ -2939,6 +2977,13 @@ impl<'a> Socket<'a> {
             self.remote_last_seq = self
                 .remote_last_seq
                 .max(repr.seq_number + repr.segment_len());
+        }
+        // Only new data counts: a retransmission resends from SND.UNA.
+        if !repr.payload.is_empty()
+            && repr.payload.len() < data_mss
+            && repr.seq_number + repr.payload.len() == self.remote_last_seq
+        {
+            self.small_segment_end = Some(self.remote_last_seq);
         }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
@@ -10165,6 +10210,211 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    // =========================================================================================//
+    // Tests for sender-side silly window syndrome avoidance
+    // =========================================================================================//
+
+    #[test]
+    fn test_sws_holds_window_remainder_while_small_segment_unacked() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        s.set_nagle_enabled(false);
+        s.remote_mss = 4;
+        s.remote_win_len = 6;
+        s.send_slice(b"abcdefghijklmnopqrst").unwrap();
+
+        // A window that is not a multiple of the MSS: one small segment goes out.
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcd"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ef"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+
+        // The window frees three octets while "ef" is unacknowledged and full segments
+        // are queued: no second small segment.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 4),
+            window_len: 5,
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 10);
+
+        // Once it is acknowledged, the window allows a full segment and one small one.
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            window_len: 5,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 20, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ghij"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 20, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 10,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"k"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 20);
+
+        // The full segment's ACK frees four octets while "k" is unacknowledged.
+        send!(s, time 30, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 10),
+            window_len: 5,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 30, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 11,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"lmno"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 30);
+    }
+
+    #[test]
+    fn test_sws_sends_small_writes_at_once() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+        s.remote_mss = 6;
+
+        // A lone small write goes out at once, and so does the next one while the first
+        // is unacknowledged: it empties the send buffer.
+        s.send_slice(b"abc").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abc"[..],
+            ..RECV_TEMPL
+        }));
+        s.send_slice(b"de").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"de"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 0);
+    }
+
+    #[test]
+    fn test_sws_small_segment_goes_out_when_nothing_is_in_flight() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        s.set_nagle_enabled(false);
+        s.remote_mss = 4;
+        s.remote_win_len = 6;
+        s.send_slice(b"abcdefghij").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcd"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ef"[..],
+            ..RECV_TEMPL
+        }));
+
+        // A retransmission timeout rewinds to SND.UNA: nothing is in flight any more, so
+        // the window, cut to three octets, is used at once.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 4),
+            window_len: 3,
+            ..SEND_TEMPL
+        });
+        recv!(s, time 5000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"efg"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    /// Emits everything `s` sends at `time`, as (offset from the first data octet, length).
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn sent_segments(s: &mut TestSocket, time: i64) -> Vec<(usize, usize)> {
+        let mut segments = Vec::new();
+        s.cx.set_now(Instant::from_millis(time));
+        loop {
+            let mut sent = None;
+            let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                sent = Some((repr.seq_number - (LOCAL_SEQ + 1), repr.payload.len()));
+                Ok(())
+            });
+            assert_eq!(result, Ok(()));
+            match sent {
+                Some(segment) if segment.1 > 0 => segments.push(segment),
+                _ => return segments,
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_sws_slow_start_keeps_three_duplicate_acks_for_a_single_loss() {
+        const MSS: usize = 1000;
+        let mut s = socket_established_with_buffer_sizes(65536, 64);
+        s.set_nagle_enabled(false);
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.congestion_controller.inner_mut().set_mss(MSS);
+        s.remote_mss = MSS;
+        s.remote_win_len = 65535;
+        let data = vec![b'x'; 65536];
+        s.send_slice(&data).unwrap();
+
+        // The initial window of 2048 octets is two segments and a 48-octet remainder,
+        // which goes out: nothing smaller is outstanding.
+        let mut flight = sent_segments(&mut s, 0);
+        assert_eq!(flight, [(0, MSS), (MSS, MSS), (2 * MSS, 48)]);
+
+        // Slow start: every segment is acknowledged on its own. At most one segment
+        // below the MSS is ever outstanding.
+        let mut time = 0;
+        while flight.len() < 6 {
+            time += 10;
+            let (offset, len) = flight.remove(0);
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + offset + len),
+                window_len: 65535,
+                ..SEND_TEMPL
+            });
+            flight.extend(sent_segments(&mut s, time));
+            let small = flight.iter().filter(|&&(_, len)| len < MSS).count();
+            assert!(small <= 1, "{flight:?}");
+        }
+
+        // The first segment of the window is lost: every later one elicits a duplicate
+        // ACK, at least three of them, and the third triggers the fast retransmit.
+        let (lost, lost_len) = flight[0];
+        time += 10;
+        for _ in 1..flight.len() {
+            send!(s, time time, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + lost),
+                window_len: 65535,
+                ..SEND_TEMPL
+            });
+        }
+        assert!(s.in_fast_recovery);
+        assert_eq!(sent_segments(&mut s, time).first(), Some(&(lost, lost_len)));
     }
 
     // =========================================================================================//
