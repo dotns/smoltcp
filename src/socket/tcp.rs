@@ -1463,9 +1463,20 @@ impl<'a> Socket<'a> {
     }
 
     fn cwnd_remaining(&self) -> usize {
+        // RFC 3042 Limited Transmit: the first and second duplicate ACK each let one more
+        // segment of new data out beyond the congestion window, so a loss in a window of
+        // fewer than four segments still elicits the third duplicate ACK instead of a
+        // retransmission timeout. Not while `recover` is set: those duplicates start no
+        // fast retransmit.
+        let limited_transmit = if self.recover.is_none() {
+            usize::from(self.local_rx_dup_acks.min(2)) * self.remote_mss
+        } else {
+            0
+        };
         self.congestion_controller
             .inner()
             .window()
+            .saturating_add(limited_transmit)
             .saturating_sub(self.flight_size())
     }
 
@@ -10415,6 +10426,39 @@ mod test {
         }
         assert!(s.in_fast_recovery);
         assert_eq!(sent_segments(&mut s, time).first(), Some(&(lost, lost_len)));
+    }
+
+    #[test]
+    #[cfg(feature = "socket-tcp-cubic")]
+    fn test_limited_transmit_recovers_a_loss_in_a_two_segment_window() {
+        const MSS: usize = 1024;
+        let mut s = socket_established_with_buffer_sizes(16384, 64);
+        s.set_nagle_enabled(false);
+        s.set_congestion_control(CongestionControl::Cubic);
+        s.remote_mss = MSS;
+        let dup_ack = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 65535,
+            ..SEND_TEMPL
+        };
+        send!(s, time 0, dup_ack);
+        let data = vec![b'x'; 16384];
+        s.send_slice(&data).unwrap();
+
+        // The initial window of 2048 octets is exactly two segments.
+        assert_eq!(sent_segments(&mut s, 0), [(0, MSS), (MSS, MSS)]);
+
+        // The first is lost. Each of the first two duplicate ACKs sends one new segment
+        // beyond the congestion window, whose duplicate ACKs then start the fast
+        // retransmit; without them the loss would wait for the retransmission timeout.
+        send!(s, time 10, dup_ack);
+        assert_eq!(sent_segments(&mut s, 10), [(2 * MSS, MSS)]);
+        send!(s, time 20, dup_ack);
+        assert_eq!(sent_segments(&mut s, 20), [(3 * MSS, MSS)]);
+        send!(s, time 30, dup_ack);
+        assert!(s.in_fast_recovery);
+        assert_eq!(sent_segments(&mut s, 30).first(), Some(&(0, MSS)));
     }
 
     // =========================================================================================//
