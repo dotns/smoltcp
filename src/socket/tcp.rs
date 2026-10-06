@@ -158,6 +158,13 @@ const RTTE_MIN_RTO: u32 = 1000;
 // seconds
 const RTTE_MAX_RTO: u32 = 60_000;
 
+// RFC 8985 (7.2): the probe timeout is twice the smoothed RTT plus a margin for timer
+// granularity and a delayed ACK of the remote, ...
+const PTO_MARGIN: u32 = 10;
+
+// ... or plus a worst-case delayed ACK (WCDelAckT) when only one segment is in flight.
+const PTO_WC_DEL_ACK: u32 = 200;
+
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 struct RttEstimator {
@@ -286,6 +293,9 @@ enum Timer {
     },
     Retransmit {
         expires_at: Instant,
+        /// When to resend the first unacknowledged segment ahead of the timeout, if no
+        /// ACK of new data arrives first (a tail loss probe).
+        probe_at: Option<Instant>,
     },
     FastRetransmit,
     ZeroWindowProbe {
@@ -318,9 +328,31 @@ impl Timer {
 
     fn should_retransmit(&self, timestamp: Instant) -> bool {
         match *self {
-            Timer::Retransmit { expires_at } if timestamp >= expires_at => true,
+            Timer::Retransmit { expires_at, .. } if timestamp >= expires_at => true,
             Timer::FastRetransmit => true,
             _ => false,
+        }
+    }
+
+    fn should_probe(&self, timestamp: Instant) -> bool {
+        match *self {
+            Timer::Retransmit {
+                probe_at: Some(probe_at),
+                ..
+            } => timestamp >= probe_at,
+            _ => false,
+        }
+    }
+
+    fn clear_probe(&mut self) {
+        if let Timer::Retransmit { probe_at, .. } = self {
+            *probe_at = None;
+        }
+    }
+
+    fn rearm_probe(&mut self, timestamp: Instant, probe: Option<Duration>) {
+        if let Timer::Retransmit { probe_at, .. } = self {
+            *probe_at = probe.map(|probe| timestamp + probe);
         }
     }
 
@@ -347,7 +379,10 @@ impl Timer {
                 keep_alive_at: None,
             } => PollAt::Ingress,
             Timer::ZeroWindowProbe { expires_at, .. } => PollAt::Time(expires_at),
-            Timer::Retransmit { expires_at, .. } => PollAt::Time(expires_at),
+            Timer::Retransmit {
+                expires_at,
+                probe_at,
+            } => PollAt::Time(probe_at.map_or(expires_at, |probe_at| probe_at.min(expires_at))),
             Timer::FastRetransmit => PollAt::Now,
             Timer::Close { expires_at } => PollAt::Time(expires_at),
         }
@@ -373,7 +408,7 @@ impl Timer {
         }
     }
 
-    fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
+    fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration, probe: Option<Duration>) {
         match *self {
             Timer::Idle { .. }
             | Timer::FastRetransmit
@@ -381,6 +416,7 @@ impl Timer {
             | Timer::ZeroWindowProbe { .. } => {
                 *self = Timer::Retransmit {
                     expires_at: timestamp + delay,
+                    probe_at: probe.map(|probe| timestamp + probe),
                 }
             }
             Timer::Close { .. } => (),
@@ -532,6 +568,9 @@ pub struct Socket<'a> {
     /// The end of the last data segment sent below the MSS, for sender-side silly window
     /// syndrome avoidance: another one cut short by a window waits until this is acked.
     small_segment_end: Option<TcpSeqNumber>,
+    /// Whether a tail loss probe was sent since SND.UNA last advanced: one probe per
+    /// stall, then only the retransmission timeout.
+    probe_sent: bool,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -626,6 +665,7 @@ impl<'a> Socket<'a> {
             recover: None,
             in_fast_recovery: false,
             small_segment_end: None,
+            probe_sent: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -967,6 +1007,7 @@ impl<'a> Socket<'a> {
         self.recover = None;
         self.in_fast_recovery = false;
         self.small_segment_end = None;
+        self.probe_sent = false;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1474,6 +1515,26 @@ impl<'a> Socket<'a> {
             self.timer.set_for_idle(timestamp, self.keep_alive);
         }
         true
+    }
+
+    /// The probe timeout to arm with the retransmission timer: a tail loss probe in the
+    /// manner of RFC 8985, section 7.
+    ///
+    /// The probe resends the first unacknowledged segment rather than the last one: without
+    /// a SACK scoreboard, that is where the loss the probe is meant to reveal must be. It
+    /// is also armed in loss recovery, where it detects a lost retransmission (RACK's job
+    /// in RFC 8985) after about two round trips instead of a timeout of at least a second.
+    /// None without an RTT measurement, once a probe was sent for the current SND.UNA, and
+    /// when it would not expire before the retransmission timeout.
+    fn probe_timeout(&self) -> Option<Duration> {
+        if self.probe_sent || !self.rtte.have_measurement || self.tx_buffer.is_empty() {
+            return None;
+        }
+        let mut pto = 2 * self.rtte.srtt + PTO_MARGIN;
+        if self.flight_size() <= self.remote_mss {
+            pto += PTO_WC_DEL_ACK;
+        }
+        (pto < self.rtte.rto).then(|| Duration::from_millis(pto as _))
     }
 
     /// Number of octets transmitted but not yet ACKed.
@@ -2194,6 +2255,9 @@ impl<'a> Socket<'a> {
             .set_remote_window(new_remote_win_len);
 
         if ack_len > 0 {
+            // New data is acknowledged: the next stall may be probed again.
+            self.probe_sent = false;
+
             // Dequeue acknowledged octets.
             debug_assert!(self.tx_buffer.len() >= ack_len);
             tcp_trace!(
@@ -2334,7 +2398,8 @@ impl<'a> Socket<'a> {
                 } else if ack_len > 0 {
                     // (5.3) ACK of new data in ESTABLISHED state restart the retransmit timer.
                     let rto = self.rtte.retransmission_timeout();
-                    self.timer.set_for_retransmit(cx.now(), rto);
+                    let probe = self.probe_timeout();
+                    self.timer.set_for_retransmit(cx.now(), rto, probe);
                 }
             }
             Timer::Idle { .. } => {
@@ -2664,6 +2729,9 @@ impl<'a> Socket<'a> {
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
+
+                // The resent data may be probed again.
+                self.probe_sent = false;
             } else {
                 // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
                 net_debug!("retransmitting for fast-retransmit");
@@ -2695,6 +2763,27 @@ impl<'a> Socket<'a> {
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
+        } else if self.timer.should_probe(cx.now()) {
+            // The retransmission timer keeps running: if the probe is lost too, the timeout
+            // recovers as before.
+            self.timer.clear_probe();
+            if self.remote_win_len > 0 && !self.tx_buffer.is_empty() {
+                net_debug!("probe timeout: resending the first unacknowledged segment");
+                self.probe_sent = true;
+                // Outside of loss recovery the probe starts fast recovery, as a third
+                // duplicate ACK would. In fast recovery, or after a timeout, it only
+                // resends: the window was already reduced for this loss.
+                if self.recover.is_none() {
+                    let in_flight = self.flight_size();
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_loss(cx.now(), in_flight);
+                    self.recover = Some(self.empty_segment_seq());
+                    self.in_fast_recovery = true;
+                }
+                self.pending_fast_retransmit = true;
+                self.rtte.on_retransmit();
+            }
         }
 
         #[cfg(feature = "socket-tcp-pause-synack")]
@@ -3052,7 +3141,13 @@ impl<'a> Socket<'a> {
             // retransmission), if the timer is not running, start it running
             // so that it will expire after RTO seconds.
             let rto = self.rtte.retransmission_timeout();
-            self.timer.set_for_retransmit(cx.now(), rto);
+            let probe = self.probe_timeout();
+            self.timer.set_for_retransmit(cx.now(), rto, probe);
+        } else if repr.segment_len() > 0 {
+            // RFC 8985 (7.2): every segment sent restarts the probe timeout, but not the
+            // retransmission timeout.
+            let probe = self.probe_timeout();
+            self.timer.rearm_probe(cx.now(), probe);
         }
 
         if self.state == State::Closed {
@@ -3468,6 +3563,7 @@ mod test {
         s.remote_seq_no = REMOTE_SEQ + 1 + 1;
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis_const(1000),
+            probe_at: None,
         };
         s
     }
@@ -7002,7 +7098,7 @@ mod test {
         // The resend restarted the retransmission timer.
         assert!(matches!(
             s.timer,
-            Timer::Retransmit { expires_at } if expires_at > Instant::from_millis(1000)
+            Timer::Retransmit { expires_at, .. } if expires_at > Instant::from_millis(1000)
         ));
 
         // A later message with the same size changes nothing.
@@ -7111,6 +7207,16 @@ mod test {
             ..SEND_TEMPL
         });
         // The ACK of the first packet should restart the retransmit timer and delay a retransmission.
+        // Before it expires, the tail loss probe resends the second packet: two smoothed RTTs
+        // (600 ms) plus the margins for a lone segment after the ACK.
+        recv_nothing!(s, time 2009);
+        recv!(s, time 2010, Ok(TcpRepr {
+            control:    TcpControl::Psh,
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"012345"[..],
+            ..RECV_TEMPL
+        }), exact);
         recv_nothing!(s, time 2399);
         // The second packet should be re-sent.
         recv!(s, time 2400, Ok(TcpRepr {
@@ -7159,7 +7265,8 @@ mod test {
             ..RECV_TEMPL
         }), exact);
 
-        recv_nothing!(s, time 1550);
+        // Nothing else until the tail loss probe (5 ms smoothed RTT) would resend it.
+        recv_nothing!(s, time 1519);
     }
 
     #[test]
@@ -7845,6 +7952,197 @@ mod test {
         // An ACK reaching `recover` clears it.
         ack_at(&mut s, 3050, 19);
         assert_eq!(s.recover, None);
+    }
+
+    /// An established socket with `remote_mss` 3 whose first segment was acknowledged
+    /// 10 ms after it was sent, for a smoothed RTT of 10 ms. Nothing is in flight.
+    fn socket_with_rtt_measurement() -> TestSocket {
+        let mut s = socket_established();
+        s.remote_mss = 3;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaa").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"aaa"[..],
+            ..RECV_TEMPL
+        }));
+        ack_at(&mut s, 10, 4);
+        assert_eq!(s.rtte.srtt, 10);
+        assert!(s.timer.is_idle());
+        s
+    }
+
+    #[test]
+    fn test_tail_loss_probe_resends_the_first_unacknowledged_segment() {
+        let mut s = socket_with_rtt_measurement();
+        s.send_slice(b"bbbCCCddd").unwrap();
+        for (i, payload) in [b"bbb", b"CCC", b"ddd"].into_iter().enumerate() {
+            recv!(s, time 100, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 4 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+
+        // All three are lost, so no ACK comes back. Two smoothed RTTs plus the margin
+        // after the send, long before the 1 s retransmission timeout, the probe resends
+        // the first segment and starts fast recovery.
+        recv_nothing!(s, time 129);
+        recv!(s, time 130, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.in_fast_recovery);
+        assert_eq!(s.recover, Some(LOCAL_SEQ + 13));
+
+        // One probe per stall: the next resend waits for the retransmission timeout.
+        recv_nothing!(s, time 1099);
+        assert!(matches!(
+            s.timer,
+            Timer::Retransmit { expires_at, probe_at: None } if expires_at == Instant::from_millis(1100)
+        ));
+
+        // The partial ACK of the probe resends the next segment at once and arms the
+        // probe again.
+        ack_at(&mut s, 1099, 7);
+        recv!(s, time 1099, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"CCC"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(matches!(
+            s.timer,
+            Timer::Retransmit {
+                probe_at: Some(_),
+                ..
+            }
+        ));
+        ack_at(&mut s, 1110, 13);
+        assert!(!s.in_fast_recovery);
+        assert!(s.timer.is_idle());
+        recv_nothing!(s, time 5000);
+    }
+
+    #[test]
+    fn test_tail_loss_probe_waits_for_a_delayed_ack_of_a_lone_segment() {
+        let mut s = socket_with_rtt_measurement();
+        s.send_slice(b"bbb").unwrap();
+        recv!(s, time 100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+
+        // With one segment in flight, the remote may hold its ACK back for a while.
+        recv_nothing!(s, time 329);
+        recv!(s, time 330, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_tail_loss_probe_resends_a_lost_fast_retransmission() {
+        let mut s = socket_with_rtt_measurement();
+        s.send_slice(b"bbbCCCdddEEE").unwrap();
+        for (i, payload) in [b"bbb", b"CCC", b"ddd", b"EEE"].into_iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 4 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+        for time in [1010, 1012, 1014] {
+            ack_at(&mut s, time, 4);
+        }
+        recv!(s, time 1015, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+
+        // The fast retransmission is lost as well. Instead of the retransmission timeout
+        // (1 s), the probe resends it two smoothed RTTs plus the margin later.
+        recv_nothing!(s, time 1044);
+        recv!(s, time 1045, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.in_fast_recovery);
+        ack_at(&mut s, 1055, 16);
+        assert!(!s.in_fast_recovery);
+        assert!(s.timer.is_idle());
+    }
+
+    #[test]
+    fn test_tail_loss_probe_resends_a_lost_segment_after_a_timeout() {
+        let mut s = socket_with_rtt_measurement();
+        s.send_slice(b"bbbCCC").unwrap();
+        for (i, payload) in [b"bbb", b"CCC"].into_iter().enumerate() {
+            recv!(s, time 100, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 4 + 3 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload:    &payload[..],
+                ..RECV_TEMPL
+            }));
+        }
+        // The probe is lost too; the timeout resends from SND.UNA.
+        recv!(s, time 130, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 4,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"bbb"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(!s.in_fast_recovery);
+
+        // bbb arrives, but CCC resent after it is lost. The stall after the ACK is probed
+        // instead of waiting for the doubled retransmission timeout.
+        ack_at(&mut s, 1110, 7);
+        recv!(s, time 1110, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"CCC"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1339);
+        recv!(s, time 1340, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 7,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"CCC"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(!s.in_fast_recovery);
+        ack_at(&mut s, 1350, 10);
+        assert!(s.timer.is_idle());
+    }
+
+    #[test]
+    fn test_no_tail_loss_probe_without_an_rtt_measurement() {
+        let mut s = socket_sent_six_segments();
+        assert!(matches!(s.timer, Timer::Retransmit { probe_at: None, .. }));
+        recv_nothing!(s, time 1999);
     }
 
     #[test]
@@ -10784,11 +11082,11 @@ mod test {
         const RTO: Duration = Duration::from_millis(100);
         let mut r = Timer::new();
         assert!(!r.should_retransmit(Instant::from_secs(1)));
-        r.set_for_retransmit(Instant::from_millis(1000), RTO);
+        r.set_for_retransmit(Instant::from_millis(1000), RTO, None);
         assert!(!r.should_retransmit(Instant::from_millis(1000)));
         assert!(!r.should_retransmit(Instant::from_millis(1050)));
         assert!(r.should_retransmit(Instant::from_millis(1101)));
-        r.set_for_retransmit(Instant::from_millis(1101), RTO);
+        r.set_for_retransmit(Instant::from_millis(1101), RTO, None);
         assert!(!r.should_retransmit(Instant::from_millis(1101)));
         assert!(!r.should_retransmit(Instant::from_millis(1150)));
         assert!(!r.should_retransmit(Instant::from_millis(1200)));
