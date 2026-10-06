@@ -1436,6 +1436,46 @@ impl<'a> Socket<'a> {
         self.tx_buffer.len()
     }
 
+    /// Lower the maximum segment size to `mss` after an ICMP Fragmentation Needed or an
+    /// ICMPv6 Packet Too Big quoted the segment starting at `seq` (path MTU discovery,
+    /// RFC 1191 and RFC 8201).
+    ///
+    /// The size only goes down: nothing changes, and `false` is returned, unless the
+    /// connection is synchronized, `seq` lies within the sent and unacknowledged range
+    /// `SND.UNA..SND.NXT` and `mss` is below the current maximum segment size. `mss` is
+    /// raised to the minimum remote MSS accepted from a SYN.
+    ///
+    /// The data in flight was sent in segments too large for the path and is resent at
+    /// once in segments of the new size, without a congestion response: the drop was
+    /// not a sign of congestion (RFC 1191 section 7).
+    pub fn reduce_mss(&mut self, timestamp: Instant, mss: usize, seq: TcpSeqNumber) -> bool {
+        if matches!(self.state, State::Closed | State::Listen | State::SynSent) {
+            return false;
+        }
+        let mss = mss.max(MIN_REMOTE_MSS);
+        if mss >= self.remote_mss || seq < self.local_seq_no || seq >= self.empty_segment_seq() {
+            return false;
+        }
+        net_debug!("path mtu: lowering mss from {} to {}", self.remote_mss, mss);
+        self.remote_mss = mss;
+        self.congestion_controller.inner_mut().set_mss(mss);
+
+        // As after a retransmission timeout, except that neither the congestion window nor
+        // the timeout backs off: resend from SND.UNA, and let duplicate ACKs of the data
+        // sent so far start no fast retransmit.
+        self.recover = Some(self.empty_segment_seq());
+        self.in_fast_recovery = false;
+        self.pending_fast_retransmit = false;
+        self.remote_last_seq = self.local_seq_no;
+        self.rtte.on_retransmit();
+        // The first resent segment restarts the retransmission timer. On a zero window it
+        // keeps running, since no segment goes out to restart it.
+        if self.remote_win_len > 0 && self.timer.is_retransmit() {
+            self.timer.set_for_idle(timestamp, self.keep_alive);
+        }
+        true
+    }
+
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
@@ -6920,6 +6960,88 @@ mod test {
             ..RECV_TEMPL
         }), exact);
         recv_nothing!(s, time 1550);
+    }
+
+    #[test]
+    fn test_reduce_mss_resends_in_flight_data_at_once() {
+        let mut s = socket_established_with_buffer_sizes(128, 64);
+        s.remote_mss = 100;
+        let data = [b'a'; 50]
+            .iter()
+            .chain(&[b'b'; 50])
+            .copied()
+            .collect::<Vec<u8>>();
+        s.send_slice(&data).unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            control:    TcpControl::Psh,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..],
+            ..RECV_TEMPL
+        }), exact);
+        recv_nothing!(s, time 10);
+
+        assert!(s.reduce_mss(Instant::from_millis(20), 50, LOCAL_SEQ + 1));
+        assert_eq!(s.remote_mss, 50);
+        // Resent before the retransmission timeout, in segments of the new size.
+        recv!(s, time 20, Ok(TcpRepr {
+            control:    TcpControl::None,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..50],
+            ..RECV_TEMPL
+        }), exact);
+        recv!(s, time 20, Ok(TcpRepr {
+            control:    TcpControl::Psh,
+            seq_number: LOCAL_SEQ + 1 + 50,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[50..],
+            ..RECV_TEMPL
+        }), exact);
+        recv_nothing!(s, time 30);
+        // The resend restarted the retransmission timer.
+        assert!(matches!(
+            s.timer,
+            Timer::Retransmit { expires_at } if expires_at > Instant::from_millis(1000)
+        ));
+
+        // A later message with the same size changes nothing.
+        assert!(!s.reduce_mss(Instant::from_millis(30), 50, LOCAL_SEQ + 1 + 50));
+        recv_nothing!(s, time 40);
+    }
+
+    #[test]
+    fn test_reduce_mss_ignores_invalid_messages() {
+        let mut s = socket_established();
+        s.remote_mss = 100;
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            control:    TcpControl::Psh,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }), exact);
+        let now = Instant::from_millis(10);
+        // Not below the current size.
+        assert!(!s.reduce_mss(now, 100, LOCAL_SEQ + 1));
+        assert!(!s.reduce_mss(now, 1400, LOCAL_SEQ + 1));
+        // Outside SND.UNA..SND.NXT: acknowledged or never sent.
+        assert!(!s.reduce_mss(now, 60, LOCAL_SEQ));
+        assert!(!s.reduce_mss(now, 60, LOCAL_SEQ + 1 + 6));
+        assert_eq!(s.remote_mss, 100);
+        recv_nothing!(s, time 10);
+
+        // Raised to the minimum remote MSS.
+        assert!(s.reduce_mss(now, 1, LOCAL_SEQ + 1));
+        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+
+        // Not before the connection is synchronized.
+        let mut s = socket_syn_sent();
+        assert!(!s.reduce_mss(now, 60, LOCAL_SEQ));
+        let mut s = socket();
+        s.listen(LISTEN_END).unwrap();
+        assert!(!s.reduce_mss(now, 60, LOCAL_SEQ));
     }
 
     #[test]
