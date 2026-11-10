@@ -857,7 +857,8 @@ impl<'a> Socket<'a> {
     /// does that whenever the ACK moved by other than a multiple of the scale unit, down to a
     /// zero window while the remote still has data in flight towards the edge. In that case the
     /// free space is rounded up instead. The window then reaches less than one scale unit past
-    /// the buffer, and `process` only accepts what fits.
+    /// the buffer, and `process` only accepts what fits. A remote that fills the unit closes
+    /// the window with its SND.NXT past RCV.NXT; `process` still takes the ACKs it sends then.
     #[inline]
     fn scaled_window(&self) -> u16 {
         let window = self.rx_buffer.window();
@@ -1969,6 +1970,11 @@ impl<'a> Socket<'a> {
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
+        // Set when the segment is unacceptable but its acknowledgement is still processed.
+        let mut ack_only = false;
+        // Whether SEG.WND updates SND.WND.
+        let mut update_window = true;
+
         let (payload, payload_offset) = match self.state {
             // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
             State::Listen | State::SynSent => (&[][..], 0),
@@ -1991,6 +1997,30 @@ impl<'a> Socket<'a> {
                             net_debug!(
                                 "zero-length segment not inside zero-length window, will send an ACK."
                             );
+                            // RFC 9293 3.10.7.4: with a zero receive window, valid ACKs are
+                            // still processed. The remote's SEQ is its SND.NXT, which passes
+                            // RCV.NXT once it sent bytes we could not take (a window rounded up
+                            // to the scale reaches past the buffer). Dropping its ACKs freezes
+                            // SND.UNA and SND.WND, and with both windows closed neither side
+                            // ever sends again.
+                            if self.state != State::TimeWait
+                                && matches!(repr.control, TcpControl::None | TcpControl::Psh)
+                                && let Some(ack_number) = repr.ack_number
+                                && self.local_seq_no <= ack_number
+                                && ack_number <= self.empty_segment_seq()
+                            {
+                                ack_only = true;
+                                // SND.WL1 and SND.WL2 are the SEQ and ACK of the last
+                                // accepted segment, which always updates the window.
+                                update_window =
+                                    match (self.local_rx_last_seq, self.local_rx_last_ack) {
+                                        (Some(wl1), Some(wl2)) => {
+                                            wl1 < segment_start
+                                                || (wl1 == segment_start && wl2 <= ack_number)
+                                        }
+                                        _ => true,
+                                    };
+                            }
                             false
                         }
                     }
@@ -2039,6 +2069,11 @@ impl<'a> Socket<'a> {
                         &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
                         overlap_start - window_start,
                     )
+                } else if ack_only {
+                    if update_window {
+                        self.local_rx_last_seq = Some(repr.seq_number);
+                    }
+                    (&[][..], 0)
                 } else {
                     // Out-of-window RSTs are silently dropped, per RFC 9293
                     // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
@@ -2324,12 +2359,14 @@ impl<'a> Socket<'a> {
             _ => self.remote_win_scale.unwrap_or(0),
         };
         let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
-        let is_window_update = new_remote_win_len != self.remote_win_len;
-        self.remote_win_len = new_remote_win_len;
+        let is_window_update = update_window && new_remote_win_len != self.remote_win_len;
+        if update_window {
+            self.remote_win_len = new_remote_win_len;
 
-        self.congestion_controller
-            .inner_mut()
-            .set_remote_window(new_remote_win_len);
+            self.congestion_controller
+                .inner_mut()
+                .set_remote_window(new_remote_win_len);
+        }
 
         if ack_len > 0 {
             // New data is acknowledged: the next stall may be probed again.
@@ -2507,6 +2544,11 @@ impl<'a> Socket<'a> {
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
             tcp_trace!("stopping zero-window-probe timer");
             self.timer.set_for_idle(cx.now(), self.keep_alive);
+        }
+
+        // The segment itself stays unacceptable: answer it as before.
+        if ack_only {
+            return self.challenge_ack_reply(cx, ip_repr, repr);
         }
 
         let payload_len = payload.len();
@@ -9230,6 +9272,181 @@ mod test {
                 ..RECV_TEMPL
             })
         );
+    }
+
+    // Both windows closed, and the remote's sequence number is past our (zero) window because
+    // it sent into a window we rounded up. Its window update must still be taken (RFC 9293
+    // 3.10.7.4: with RCV.WND zero, valid ACKs are processed).
+    #[test]
+    fn test_zero_window_both_sides_window_update_past_window() {
+        let mut s = socket_established_both_windows_closed();
+        // The peer's pure ACK opens its window. Its sequence number is one past our window
+        // (it sent a byte we could not take).
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 256,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.remote_win_len, 256, "the window update was ignored");
+    }
+
+    // Our receive window is closed, the remote's SEQ is 12 bytes past it (it sent into a
+    // window we rounded up), and its pure ACK acknowledges our data. Dropping that ACK
+    // freezes SND.UNA: our send buffer never drains.
+    #[test]
+    fn test_zero_window_ack_past_window_acknowledges_data() {
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.assembler = Assembler::new();
+        s.send_slice(b"xyz").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 6,
+                payload: &b"xyz"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.send_queue(), 3);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6 + 12,
+                ack_number: Some(LOCAL_SEQ + 1 + 3),
+                window_len: 256,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 3,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.send_queue(), 0, "the acknowledgement was ignored");
+    }
+
+    /// A socket whose 6-byte receive buffer the remote filled, with "xyz" queued for a remote
+    /// that closed its window.
+    fn socket_established_both_windows_closed() -> TestSocket {
+        let mut s = socket_established();
+        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.assembler = Assembler::new();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        s.send_slice(b"xyz").unwrap();
+        assert_eq!(s.remote_win_len, 0);
+        s
+    }
+
+    // The window of a segment past a zero window follows the SND.WL1/SND.WL2 rule: one with a
+    // lower SEQ than the last window update (reordered) must not close the window again.
+    #[test]
+    fn test_zero_window_ack_past_window_reordered_keeps_window() {
+        let mut s = socket_established_both_windows_closed();
+        let ack = TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 6),
+            window_len: 0,
+            ..RECV_TEMPL
+        };
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 256,
+                ..SEND_TEMPL
+            },
+            Some(ack)
+        );
+        assert_eq!(s.remote_win_len, 256);
+        send!(
+            s,
+            time 2000,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                ..SEND_TEMPL
+            },
+            Some(ack)
+        );
+        assert_eq!(
+            s.remote_win_len, 256,
+            "a reordered segment closed the window"
+        );
+    }
+
+    // Past a zero window, only an ACK of data actually sent (up to SND.NXT) is processed.
+    #[test]
+    fn test_zero_window_ack_past_window_beyond_snd_nxt_ignored() {
+        let mut s = socket_established_both_windows_closed();
+        // "xyz" is queued but was never sent: SND.NXT is LOCAL_SEQ + 1.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7,
+                ack_number: Some(LOCAL_SEQ + 1 + 3),
+                window_len: 256,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.send_queue(), 3);
+        assert_eq!(s.remote_win_len, 0);
     }
 
     #[test]
